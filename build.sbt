@@ -1,8 +1,8 @@
 import Dependencies._
 
-val circeVersion = "0.12.3"
+val circeVersion = "0.13.0"
 
-ThisBuild / scalaVersion := "2.13.4"
+ThisBuild / scalaVersion := "2.13.5"
 ThisBuild / version := "0.1.0-SNAPSHOT"
 ThisBuild / organization := "io.rlecomte"
 ThisBuild / organizationName := "distributed-fsm"
@@ -25,7 +25,7 @@ lazy val core = (project in file("core"))
   .settings(
     name := "core",
     libraryDependencies += "org.typelevel" %% "cats-effect" % "3.1.0",
-    libraryDependencies += "org.typelevel" %% "cats-free" % "2.3.1",
+    libraryDependencies += "org.typelevel" %% "cats-free" % "2.6.0",
     libraryDependencies += scalacheckEffect % Test,
     libraryDependencies += scalacheckEffectMunit % Test,
     libraryDependencies += catsEffectMunit % Test,
