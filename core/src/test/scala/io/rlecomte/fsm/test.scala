@@ -1,18 +1,22 @@
 package io.rlecomte.fsm
 
-import cats.effect.IO
-import org.scalacheck.Gen
-import io.rlecomte.fsm.Workflow._
-import cats.implicits._
-import scala.concurrent.duration.FiniteDuration
-import java.util.concurrent.TimeUnit
-import io.rlecomte.fsm.RunId
-import io.rlecomte.fsm.store.EventStore
-import io.rlecomte.fsm.runtime.WorkflowRuntime
-import io.rlecomte.fsm.FSM
-import io.rlecomte.fsm.runtime.StateError
 import cats.data.WriterT
+import cats.effect.IO
+import cats.implicits._
+import io.circe.Codec
+import io.circe.Decoder
+import io.circe.Encoder
+import io.rlecomte.fsm.FSM
+import io.rlecomte.fsm.RunId
+import io.rlecomte.fsm.Workflow._
+import io.rlecomte.fsm.runtime.StateError
+import io.rlecomte.fsm.runtime.WorkflowRuntime
+import io.rlecomte.fsm.store.EventStore
 import org.scalacheck.Arbitrary
+import org.scalacheck.Gen
+
+import java.util.concurrent.TimeUnit
+import scala.concurrent.duration.FiniteDuration
 
 object test {
 
@@ -23,7 +27,7 @@ object test {
     implicit def arbitrary(implicit store: EventStore): Arbitrary[WorkflowExecutionPlan] =
       Arbitrary[WorkflowExecutionPlan] {
         for {
-          workflow <- workflowGen
+          workflow <- Gen.sized(workflowGen)
           nbPar <- Gen.choose(2, 10)
           actions <- Gen.listOfN(nbPar, Gen.choose(1, 30).flatMap(i => Gen.listOfN(i, actionGen)))
         } yield WorkflowExecutionPlan(randomRun(store, workflow, actions))
@@ -44,27 +48,30 @@ object test {
       (29, stepGen),
       (1, Gen.const(IO.raiseError(new RuntimeException("Oops"))))
     )
-  } yield step(name, effect, compensateEffect)
+  } yield step(name, effect, _ => compensateEffect)
 
-  def serialStepsGen: Gen[Workflow[Unit]] = for {
-    first <- workflowGen
-    second <- workflowGen
+  def serialStepsGen(size: Int): Gen[Workflow[Unit]] = for {
+    first <- workflowGen(size)
+    second <- workflowGen(size)
   } yield first.flatMap(_ => second)
 
-  def parStepsGen: Gen[Workflow[Unit]] = for {
+  def parStepsGen(size: Int): Gen[Workflow[Unit]] = for {
     nbPar <- Gen.choose[Int](2, 5)
     steps <- Gen.listOfN(
       nbPar,
-      workflowGen
+      workflowGen(size)
     )
   } yield steps.parSequence.as(())
 
-  def workflowGen: Gen[Workflow[Unit]] = Gen.lzy {
-    Gen.frequency(
-      (4, stepGen),
-      (1, Gen.lzy(serialStepsGen)),
-      (1, Gen.lzy(parStepsGen))
-    )
+  def workflowGen(size: Int): Gen[Workflow[Unit]] = Gen.lzy {
+    if (size <= 0) stepGen
+    else {
+      Gen.frequency(
+        (1, stepGen),
+        (1, serialStepsGen(size - 1)),
+        (1, parStepsGen(size - 1))
+      )
+    }
   }
 
   sealed trait Action
@@ -78,14 +85,18 @@ object test {
       workflow: Workflow[Unit],
       actions: List[List[Action]]
   ): IO[ExecutedActions] = for {
-    (runId, fib) <- WorkflowRuntime.start(store, FSM[Unit, Unit]("test", _ => workflow), ())
+    fib <- WorkflowRuntime.start(
+      store,
+      FSM[Unit, Unit]("test", _ => workflow, Codec.from(Decoder[Unit], Encoder[Unit])),
+      ()
+    )
     _ <- fib.join
     actions <- actions.parTraverse { workerAction =>
       workerAction
         .foldMapM[WriterT[IO, List[Action], *], Unit] { action =>
           WriterT
             .liftF[IO, List[Action], Either[StateError, Unit]](
-              runAction(store, workflow, runId, action)
+              runAction(store, workflow, fib.runId, action)
             )
             .map {
               case Right(_) => WriterT.tell[IO, List[Action]](List(action))
@@ -95,7 +106,7 @@ object test {
         .run
         .map(_._1)
     }
-  } yield ExecutedActions(runId, actions)
+  } yield ExecutedActions(fib.runId, actions)
 
   def runAction(
       store: EventStore,
@@ -105,9 +116,13 @@ object test {
   ): IO[Either[StateError, Unit]] = action match {
     case Resume =>
       WorkflowRuntime
-        .resumeSync(store, FSM[Unit, Unit]("test", _ => workflow), runId)
+        .resume(
+          store,
+          FSM[Unit, Unit]("test", _ => workflow, Codec.from(Decoder[Unit], Encoder[Unit])),
+          runId
+        )
         .flatMap {
-          case Right(v)  => IO.pure(Right(v))
+          case Right(v)  => v.join
           case Left(err) => IO.pure(Left(err))
         }
         .attempt
@@ -115,7 +130,15 @@ object test {
 
     case Compensate =>
       WorkflowRuntime
-        .compensate(store, FSM[Unit, Unit]("test", _ => workflow), runId)
+        .compensate(
+          store,
+          FSM[Unit, Unit]("test", _ => workflow, Codec.from(Decoder[Unit], Encoder[Unit])),
+          runId
+        )
+        .flatMap {
+          case Right(v)  => v.join
+          case Left(err) => IO.pure(Left(err))
+        }
         .attempt
         .as(Right(()))
   }
